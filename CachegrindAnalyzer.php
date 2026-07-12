@@ -186,28 +186,294 @@ final class CachegrindAnalyzer
         return $ticks / self::TICKS_PER_SEC;
     }
 
+    public function selfTicks(int $fnId): int
+    {
+        $incl = $this->incl[$fnId] ?? 0;
+        $child = 0;
+        foreach ($this->callees[$fnId] ?? [] as $edge) {
+            $child += (int) ($edge['ticks'] ?? 0);
+        }
+        return max(0, $incl - $child);
+    }
+
     /**
-     * @return list<array{id:int,name:string,sec:float,calls:int}>
+     * @return list<array{id:int,name:string,sec:float,self_sec:float,calls:int,file:?string,line:?int,scope:string}>
      */
-    public function topFunctions(float $minSec = 0.05, int $limit = 40): array
+    public function topFunctions(float $minSec = 0.05, int $limit = 40, string $sortBy = 'incl'): array
     {
         $rows = [];
         foreach ($this->idToName as $id => $name) {
             $sec = self::ticksToSec($this->incl[$id] ?? 0);
-            if ($sec < $minSec) {
+            $selfSec = self::ticksToSec($this->selfTicks($id));
+            $metric = $sortBy === 'self' ? $selfSec : $sec;
+            if ($metric < $minSec) {
                 continue;
             }
+            $file = $this->resolveFile($id, $name);
             $rows[] = [
                 'id' => $id,
                 'name' => $name,
                 'sec' => $sec,
+                'self_sec' => $selfSec,
                 'calls' => $this->calls[$id] ?? 0,
-                'file' => $this->resolveFile($id, $name),
+                'file' => $file,
                 'line' => $this->fnToLine[$id] ?? null,
+                'scope' => self::classifyScope($file, $name),
             ];
         }
-        usort($rows, static fn ($a, $b) => $b['sec'] <=> $a['sec']);
+        usort($rows, static function ($a, $b) use ($sortBy) {
+            $av = $sortBy === 'self' ? $a['self_sec'] : $a['sec'];
+            $bv = $sortBy === 'self' ? $b['self_sec'] : $b['sec'];
+            return $bv <=> $av;
+        });
         return array_slice($rows, 0, $limit);
+    }
+
+    public static function classifyScope(?string $file, string $name): string
+    {
+        $hay = ($file ?? '') . ' ' . $name;
+        if (str_contains($hay, '/vendor/') || str_starts_with($name, 'Composer\\') || str_starts_with($name, 'php::')) {
+            if (str_starts_with($name, 'php::') || preg_match('#^php[:\s]#', $name)) {
+                return 'php';
+            }
+            if (str_contains($hay, '/vendor/magento/') || str_contains($hay, '/lib/internal/Magento/')) {
+                return 'framework';
+            }
+            return 'vendor';
+        }
+        if (str_contains($hay, '/generated/') || str_contains($hay, '/lib/internal/Magento/')) {
+            return 'framework';
+        }
+        if (str_contains($hay, '/app/code/') || str_contains($hay, '/app/design/')) {
+            return 'app';
+        }
+        if ($file && str_starts_with($file, '/') && !str_contains($file, '/vendor/')) {
+            return 'app';
+        }
+        return 'other';
+    }
+
+    /**
+     * Roll up inclusive time by Magento Vendor/Module (or top namespace segment).
+     *
+     * @return list<array{module:string,sec:float,self_sec:float,functions:int,scope:string}>
+     */
+    public function moduleRollup(float $minSec = 0.01, int $limit = 40): array
+    {
+        /** @var array<string, array{sec:float,self_sec:float,functions:int,scope:string}> $map */
+        $map = [];
+        foreach ($this->idToName as $id => $name) {
+            $module = self::extractModule($name);
+            if ($module === null) {
+                continue;
+            }
+            $sec = self::ticksToSec($this->incl[$id] ?? 0);
+            $selfSec = self::ticksToSec($this->selfTicks($id));
+            if ($sec < 0.001 && $selfSec < 0.001) {
+                continue;
+            }
+            if (!isset($map[$module])) {
+                $file = $this->resolveFile($id, $name);
+                $map[$module] = [
+                    'sec' => 0.0,
+                    'self_sec' => 0.0,
+                    'functions' => 0,
+                    'scope' => self::classifyScope($file, $name),
+                ];
+            }
+            // Sum self-time (avoids double-counting inclusive stacks across modules)
+            $map[$module]['self_sec'] += $selfSec;
+            $map[$module]['sec'] = max($map[$module]['sec'], $sec);
+            $map[$module]['functions']++;
+        }
+        $rows = [];
+        foreach ($map as $module => $row) {
+            if ($row['self_sec'] < $minSec && $row['sec'] < $minSec) {
+                continue;
+            }
+            $rows[] = [
+                'module' => $module,
+                'sec' => $row['sec'],
+                'self_sec' => $row['self_sec'],
+                'functions' => $row['functions'],
+                'scope' => $row['scope'],
+            ];
+        }
+        usort($rows, static fn ($a, $b) => $b['self_sec'] <=> $a['self_sec']);
+        return array_slice($rows, 0, $limit);
+    }
+
+    public static function extractModule(string $fnName): ?string
+    {
+        $name = ltrim($fnName, '\\');
+        if (preg_match('#^([A-Za-z_][A-Za-z0-9_]*)\\\\([A-Za-z_][A-Za-z0-9_]*)(?:\\\\|->|::)#', $name, $m)) {
+            return $m[1] . '\\' . $m[2];
+        }
+        return null;
+    }
+
+    /**
+     * Classify Magento interception / plugin-related frames for "plugin tax" views.
+     * Kinds: interceptor | plugin | plugin_list | other (null = not tax-related).
+     */
+    public static function classifyPluginKind(string $name): ?string
+    {
+        $n = ltrim($name, '\\');
+        if (str_contains($n, '\\Interceptor->') || str_contains($n, '\\Interceptor::')
+            || str_ends_with($n, '\\Interceptor') || preg_match('#Interceptor->__#', $n)) {
+            return 'interceptor';
+        }
+        if (str_contains($n, 'PluginList') || str_contains($n, 'Interception\\PluginList')
+            || str_contains($n, 'Interception\\Interceptor')
+            || (str_contains($n, 'Definition\\Runtime') && str_contains($n, 'Interception'))) {
+            return 'plugin_list';
+        }
+        // Magento plugin classes + before/around/after hooks
+        if (preg_match('#\\\\Plugin\\\\#', $n) || preg_match('#\\\\Plugin->#', $n)
+            || preg_match('#->(before|around|after)[A-Z]#', $n)
+            || preg_match('#::(before|around|after)[A-Z]#', $n)) {
+            return 'plugin';
+        }
+        return null;
+    }
+
+    /**
+     * Roll up time spent in Magento Interceptors, Plugins, and PluginList plumbing.
+     *
+     * @return array{
+     *   total_self_sec: float,
+     *   total_sec: float,
+     *   pct_of_main: float,
+     *   kinds: list<array{kind:string,self_sec:float,sec:float,functions:int,calls:int}>,
+     *   hotspots: list<array{id:int,name:string,kind:string,sec:float,self_sec:float,calls:int,file:?string,line:?int,scope:string,module:?string}>
+     * }
+     */
+    public function pluginTax(float $minSec = 0.01, int $limit = 40): array
+    {
+        $kindAgg = [
+            'interceptor' => ['kind' => 'interceptor', 'self_sec' => 0.0, 'sec' => 0.0, 'functions' => 0, 'calls' => 0],
+            'plugin' => ['kind' => 'plugin', 'self_sec' => 0.0, 'sec' => 0.0, 'functions' => 0, 'calls' => 0],
+            'plugin_list' => ['kind' => 'plugin_list', 'self_sec' => 0.0, 'sec' => 0.0, 'functions' => 0, 'calls' => 0],
+        ];
+        $hotspots = [];
+        $totalSelf = 0.0;
+        $totalInclPeak = 0.0;
+
+        foreach ($this->idToName as $id => $name) {
+            $kind = self::classifyPluginKind($name);
+            if ($kind === null) {
+                continue;
+            }
+            $sec = self::ticksToSec($this->incl[$id] ?? 0);
+            $selfSec = self::ticksToSec($this->selfTicks($id));
+            $calls = $this->calls[$id] ?? 0;
+            if ($sec < 0.0005 && $selfSec < 0.0005) {
+                continue;
+            }
+            $kindAgg[$kind]['self_sec'] += $selfSec;
+            $kindAgg[$kind]['sec'] = max($kindAgg[$kind]['sec'], $sec);
+            $kindAgg[$kind]['functions']++;
+            $kindAgg[$kind]['calls'] += $calls;
+            $totalSelf += $selfSec;
+            $totalInclPeak = max($totalInclPeak, $sec);
+
+            if ($selfSec >= $minSec || $sec >= $minSec) {
+                $file = $this->resolveFile($id, $name);
+                $hotspots[] = [
+                    'id' => $id,
+                    'name' => $name,
+                    'kind' => $kind,
+                    'sec' => $sec,
+                    'self_sec' => $selfSec,
+                    'calls' => $calls,
+                    'file' => $file,
+                    'line' => $this->fnToLine[$id] ?? null,
+                    'scope' => self::classifyScope($file, $name),
+                    'module' => self::extractModule($name),
+                ];
+            }
+        }
+
+        usort($hotspots, static fn ($a, $b) => $b['self_sec'] <=> $a['self_sec']);
+        $kinds = array_values(array_filter(
+            $kindAgg,
+            static fn ($row) => $row['functions'] > 0
+        ));
+        usort($kinds, static fn ($a, $b) => $b['self_sec'] <=> $a['self_sec']);
+
+        $main = $this->mainSec();
+        return [
+            'total_self_sec' => $totalSelf,
+            'total_sec' => $totalInclPeak,
+            'pct_of_main' => $main > 0 ? round(($totalSelf / $main) * 100, 1) : 0.0,
+            'kinds' => $kinds,
+            'hotspots' => array_slice($hotspots, 0, $limit),
+        ];
+    }
+
+    /**
+     * Build a trimmed call tree from {main} for flame / icicle charts.
+     *
+     * @return array{name:string,value:float,self:float,id:int,file:?string,line:?int,children:list}|null
+     */
+    public function flameTree(int $maxDepth = 8, int $maxChildren = 12, float $minSec = 0.02): ?array
+    {
+        $mainId = null;
+        foreach ($this->idToName as $id => $name) {
+            if ($name === '{main}') {
+                $mainId = $id;
+                break;
+            }
+        }
+        if ($mainId === null) {
+            // Fall back to hottest root-ish function
+            $top = $this->topFunctions(0.0, 1);
+            if ($top === []) {
+                return null;
+            }
+            $mainId = $top[0]['id'];
+        }
+        return $this->buildFlameNode($mainId, $maxDepth, $maxChildren, $minSec, []);
+    }
+
+    /**
+     * @param array<int, true> $seen
+     * @return array{name:string,value:float,self:float,id:int,file:?string,line:?int,children:list}
+     */
+    private function buildFlameNode(int $fnId, int $depthLeft, int $maxChildren, float $minSec, array $seen): array
+    {
+        $name = $this->idToName[$fnId] ?? ('#' . $fnId);
+        $value = self::ticksToSec($this->incl[$fnId] ?? 0);
+        $self = self::ticksToSec($this->selfTicks($fnId));
+        $file = $this->resolveFile($fnId, $name);
+        $node = [
+            'name' => $name,
+            'value' => $value,
+            'self' => $self,
+            'id' => $fnId,
+            'file' => $file,
+            'line' => $this->fnToLine[$fnId] ?? null,
+            'scope' => self::classifyScope($file, $name),
+            'children' => [],
+        ];
+        if ($depthLeft <= 0 || isset($seen[$fnId])) {
+            return $node;
+        }
+        $seen[$fnId] = true;
+        $edges = $this->callees[$fnId] ?? [];
+        uasort($edges, static fn ($a, $b) => $b['ticks'] <=> $a['ticks']);
+        $i = 0;
+        foreach ($edges as $childId => $edge) {
+            if ($i++ >= $maxChildren) {
+                break;
+            }
+            $childSec = self::ticksToSec((int) $edge['ticks']);
+            if ($childSec < $minSec) {
+                continue;
+            }
+            $node['children'][] = $this->buildFlameNode($childId, $depthLeft - 1, $maxChildren, $minSec, $seen);
+        }
+        return $node;
     }
 
     /**
@@ -249,6 +515,154 @@ final class CachegrindAnalyzer
         return $rows;
     }
 
+    /**
+     * Profile-only HTTP / external I/O detection from the selected Cachegrind file.
+     * No static URL/domain catalogs and no source-file scraping.
+     *
+     * Finds HTTP boundary functions present in the profile, then includes those
+     * sinks and their direct callers. Service label comes from Vendor\Module in
+     * the function name when present, otherwise from the client type in the name.
+     *
+     * @return array{services: list<array{service:string,sec:float,self_sec:float,calls:int,functions:int,pct:float}>, calls: list<array{id:int,name:string,service:string,sec:float,self_sec:float,calls:int,pct:float,file:?string,line:?int,scope:string,via:string}>}
+     */
+    public function thirdPartyApis(float $minSec = 0.02, int $limit = 60): array
+    {
+        $main = $this->mainSec();
+        /** @var array<int, true> $sinkIds */
+        $sinkIds = [];
+        foreach ($this->idToName as $id => $name) {
+            if ($name !== '' && self::isHttpBoundaryName($name)) {
+                $sinkIds[$id] = true;
+            }
+        }
+
+        /** @var array<int, array<string, mixed>> $byId */
+        $byId = [];
+        foreach ($sinkIds as $sinkId => $_) {
+            $sinkName = $this->idToName[$sinkId] ?? '';
+            $this->addApiCallRow($byId, $sinkId, $sinkName, 'http-boundary', $main, $minSec);
+
+            foreach ($this->callers[$sinkId] ?? [] as $callerId => $edge) {
+                $callerName = $this->idToName[(int) $callerId] ?? '';
+                if ($callerName === '' || $callerName === '{main}') {
+                    continue;
+                }
+                if (str_contains($callerName, '\\Interceptor->') || str_contains($callerName, '\\Proxy->')) {
+                    if (!preg_match('/(restCall|request|send|getTax|collectRates|createTransaction)/i', $callerName)) {
+                        continue;
+                    }
+                }
+                $this->addApiCallRow(
+                    $byId,
+                    (int) $callerId,
+                    $callerName,
+                    'caller-of:' . self::shortName($sinkName),
+                    $main,
+                    $minSec
+                );
+            }
+        }
+
+        $calls = array_values($byId);
+        usort($calls, static fn ($a, $b) => $b['sec'] <=> $a['sec']);
+        $calls = array_slice($calls, 0, $limit);
+
+        /** @var array<string, array{service:string,sec:float,self_sec:float,calls:int,functions:int}> $byService */
+        $byService = [];
+        foreach ($calls as $row) {
+            $svc = (string) $row['service'];
+            if (!isset($byService[$svc])) {
+                $byService[$svc] = [
+                    'service' => $svc,
+                    'sec' => 0.0,
+                    'self_sec' => 0.0,
+                    'calls' => 0,
+                    'functions' => 0,
+                ];
+            }
+            $byService[$svc]['sec'] = max($byService[$svc]['sec'], (float) $row['sec']);
+            $byService[$svc]['self_sec'] += (float) $row['self_sec'];
+            $byService[$svc]['calls'] += (int) $row['calls'];
+            $byService[$svc]['functions']++;
+        }
+
+        $services = [];
+        foreach ($byService as $row) {
+            $row['pct'] = $main > 0 ? ($row['sec'] / $main) * 100.0 : 0.0;
+            $services[] = $row;
+        }
+        usort($services, static fn ($a, $b) => $b['sec'] <=> $a['sec']);
+
+        return ['services' => $services, 'calls' => $calls];
+    }
+
+    /**
+     * @param array<int, array<string, mixed>> $byId
+     */
+    private function addApiCallRow(array &$byId, int $id, string $name, string $via, float $main, float $minSec): void
+    {
+        if (isset($byId[$id])) {
+            return;
+        }
+        $sec = self::ticksToSec($this->incl[$id] ?? 0);
+        if ($sec < $minSec) {
+            return;
+        }
+        $file = $this->resolveFile($id, $name);
+        $byId[$id] = [
+            'id' => $id,
+            'name' => $name,
+            'service' => self::serviceLabelFromProfileName($name),
+            'sec' => $sec,
+            'self_sec' => self::ticksToSec($this->selfTicks($id)),
+            'calls' => $this->calls[$id] ?? 0,
+            'pct' => $main > 0 ? ($sec / $main) * 100.0 : 0.0,
+            'file' => $file,
+            'line' => $this->fnToLine[$id] ?? null,
+            'scope' => self::classifyScope($file, $name),
+            'via' => $via,
+        ];
+    }
+
+    /** True when this profile function name looks like an HTTP/network boundary. */
+    public static function isHttpBoundaryName(string $fnName): bool
+    {
+        return (bool) preg_match(
+            '/curl_exec|php::curl_|\\\\Curl->|Curl::|GuzzleHttp\\\\|Guzzle\\\\Http|restCall\b|SoapClient|stream_socket_client|fsockopen|Client->request\b|Client->send\b|Client->transfer\b/i',
+            $fnName
+        );
+    }
+
+    /** Derive a service label only from names present in the profile. */
+    public static function serviceLabelFromProfileName(string $fnName): string
+    {
+        $mod = self::extractModule($fnName);
+        if ($mod !== null) {
+            return $mod;
+        }
+        if (preg_match('/GuzzleHttp/i', $fnName)) {
+            return 'GuzzleHttp';
+        }
+        if (preg_match('/curl_exec|php::curl_|\\\\Curl->|Curl::/i', $fnName)) {
+            return 'curl';
+        }
+        if (preg_match('/SoapClient/i', $fnName)) {
+            return 'SoapClient';
+        }
+        if (preg_match('/stream_socket_client|fsockopen/i', $fnName)) {
+            return 'socket';
+        }
+        return 'HTTP';
+    }
+
+    public static function matchApiService(string $fnName): ?string
+    {
+        if (self::isHttpBoundaryName($fnName)) {
+            return self::serviceLabelFromProfileName($fnName);
+        }
+        return null;
+    }
+
     public function mainSec(): float
     {
         foreach ($this->idToName as $id => $name) {
@@ -274,9 +688,11 @@ final class CachegrindAnalyzer
             'id' => $fnId,
             'name' => $name,
             'sec' => self::ticksToSec($this->incl[$fnId] ?? 0),
+            'self_sec' => self::ticksToSec($this->selfTicks($fnId)),
             'calls' => $this->calls[$fnId] ?? 0,
             'file' => $file,
             'line' => $this->fnToLine[$fnId] ?? null,
+            'scope' => self::classifyScope($file, $name),
             'file_hint' => $file ?? $this->guessFileHint($name),
             'callers' => $this->formatEdges($this->callers[$fnId] ?? [], $edgeLimit),
             'callees' => $this->formatEdges($this->callees[$fnId] ?? [], $edgeLimit),
@@ -474,8 +890,29 @@ final class CachegrindAnalyzer
             }
         }
 
+        $tax = $this->pluginTax(0.05, 5);
+        if ($main > 0 && $tax['total_self_sec'] > 0.5 && $tax['pct_of_main'] >= 8) {
+            $tips[] = sprintf(
+                'Plugin/interceptor tax ≈ %.2fs self (%.1f%% of {main}) — review around-plugins and heavy Interceptor paths.',
+                $tax['total_self_sec'],
+                $tax['pct_of_main']
+            );
+        }
+
         if ($tips === []) {
             $tips[] = 'Click any function in the tables to see callers (where it came from) and callees (what it called).';
+        }
+
+        $apis = $this->thirdPartyApis(0.1, 20);
+        if ($apis['services'] !== []) {
+            $parts = [];
+            foreach (array_slice($apis['services'], 0, 5) as $s) {
+                $parts[] = sprintf('%s ≈ %.2fs (%.0f%%)', $s['service'], $s['sec'], $s['pct']);
+            }
+            array_unshift(
+                $tips,
+                'HTTP / network (from this profile): ' . implode('; ', $parts) . ' — see the 3rd-party APIs tab.'
+            );
         }
 
         return array_values(array_unique($tips));

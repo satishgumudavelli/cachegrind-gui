@@ -10,6 +10,7 @@ declare(strict_types=1);
 
 require_once __DIR__ . '/CachegrindAnalyzer.php';
 require_once __DIR__ . '/SourceFileResolver.php';
+require_once __DIR__ . '/ProfileMeta.php';
 
 @ini_set('memory_limit', '1024M');
 @ini_set('max_execution_time', '300');
@@ -102,6 +103,32 @@ if ($action === 'browse' || $action === 'list_dir') {
         return strcasecmp($a['name'], $b['name']);
     });
 
+    $meta = ProfileMeta::loadForDir($real);
+    $baseline = $meta['baseline'] ?? null;
+    foreach ($entries as &$e) {
+        if (!$e['is_profile']) {
+            continue;
+        }
+        $key = $e['name'];
+        $row = is_array($meta['profiles'][$key] ?? null) ? $meta['profiles'][$key] : [];
+        $e['label'] = isset($row['label']) ? (string) $row['label'] : null;
+        $e['notes'] = isset($row['notes']) ? (string) $row['notes'] : null;
+        $e['endpoint'] = isset($row['endpoint']) ? (string) $row['endpoint'] : null;
+        $e['method'] = isset($row['method']) ? (string) $row['method'] : null;
+        $e['is_baseline'] = is_string($baseline) && $baseline === $e['path'];
+    }
+    unset($e);
+
+    // Group profile names by endpoint for UI
+    $byEndpoint = [];
+    foreach ($entries as $e) {
+        if (empty($e['is_profile']) || empty($e['endpoint'])) {
+            continue;
+        }
+        $ep = (string) $e['endpoint'];
+        $byEndpoint[$ep][] = $e['name'];
+    }
+
     $parent = dirname($real);
     jsonOut([
         'ok' => true,
@@ -110,6 +137,8 @@ if ($action === 'browse' || $action === 'list_dir') {
         'roots' => array_values(array_filter(array_map('realpath', ALLOWED_ROOTS))),
         'entries' => $entries,
         'truncated' => $skipped,
+        'baseline' => is_string($baseline) && is_file($baseline) ? $baseline : null,
+        'endpoints' => $byEndpoint,
     ]);
 }
 
@@ -138,6 +167,179 @@ if ($action === 'delete_profile') {
         'deleted' => $real,
         'dir' => dirname($real),
     ]);
+}
+
+if ($action === 'meta_get') {
+    $path = (string) ($_POST['path'] ?? $_GET['path'] ?? '');
+    if ($path === '' || !isPathAllowed($path) || !is_file($path)) {
+        jsonOut(['ok' => false, 'error' => 'Profile path not allowed or missing.'], 400);
+    }
+    $real = realpath($path);
+    jsonOut(['ok' => true, 'path' => $real, 'meta' => ProfileMeta::get($real)]);
+}
+
+if ($action === 'meta_save') {
+    $path = (string) ($_POST['path'] ?? '');
+    if ($path === '' || !isPathAllowed($path) || !is_file($path) || !isCachegrindName(basename($path))) {
+        jsonOut(['ok' => false, 'error' => 'Profile path not allowed or missing.'], 400);
+    }
+    $real = realpath($path);
+    $ok = ProfileMeta::set($real, [
+        'label' => (string) ($_POST['label'] ?? ''),
+        'notes' => (string) ($_POST['notes'] ?? ''),
+        'endpoint' => (string) ($_POST['endpoint'] ?? ''),
+        'method' => (string) ($_POST['method'] ?? ''),
+    ]);
+    if (!$ok) {
+        jsonOut(['ok' => false, 'error' => 'Could not save metadata (write permissions?).'], 500);
+    }
+    jsonOut(['ok' => true, 'path' => $real, 'meta' => ProfileMeta::get($real)]);
+}
+
+if ($action === 'baseline_set') {
+    $path = (string) ($_POST['path'] ?? '');
+    $clear = !empty($_POST['clear']);
+    if ($clear) {
+        $dir = (string) ($_POST['dir'] ?? dirname($path));
+        if ($dir === '' || !isPathAllowed($dir) || !is_dir($dir)) {
+            jsonOut(['ok' => false, 'error' => 'Directory not allowed.'], 400);
+        }
+        ProfileMeta::clearBaseline($dir);
+        jsonOut(['ok' => true, 'baseline' => null, 'dir' => realpath($dir)]);
+    }
+    if ($path === '' || !isPathAllowed($path) || !is_file($path) || !isCachegrindName(basename($path))) {
+        jsonOut(['ok' => false, 'error' => 'Profile path not allowed or missing.'], 400);
+    }
+    $real = realpath($path);
+    if (!ProfileMeta::setBaseline($real)) {
+        jsonOut(['ok' => false, 'error' => 'Could not set baseline.'], 500);
+    }
+    jsonOut(['ok' => true, 'baseline' => $real]);
+}
+
+if ($action === 'cleanup') {
+    $dir = (string) ($_POST['dir'] ?? '');
+    $keepDays = (int) ($_POST['keep_days'] ?? 14);
+    $keepDays = max(0, min(3650, $keepDays));
+    $keepNewest = (int) ($_POST['keep_newest'] ?? 0);
+    $keepNewest = max(0, min(500, $keepNewest));
+    $dryRun = !empty($_POST['dry_run']);
+
+    if ($dir === '' || !isPathAllowed($dir) || !is_dir($dir)) {
+        jsonOut(['ok' => false, 'error' => 'Directory not allowed or missing.'], 400);
+    }
+    $real = realpath($dir);
+    $profiles = [];
+    foreach (@scandir($real) ?: [] as $name) {
+        if (!isCachegrindName($name)) {
+            continue;
+        }
+        $full = $real . '/' . $name;
+        if (!is_file($full)) {
+            continue;
+        }
+        $profiles[] = [
+            'path' => $full,
+            'name' => $name,
+            'mtime' => (int) @filemtime($full),
+            'size' => (int) @filesize($full),
+        ];
+    }
+    usort($profiles, static fn ($a, $b) => $b['mtime'] <=> $a['mtime']);
+
+    $cutoff = $keepDays > 0 ? time() - ($keepDays * 86400) : null;
+    $keepPaths = [];
+    if ($keepNewest > 0) {
+        foreach (array_slice($profiles, 0, $keepNewest) as $p) {
+            $keepPaths[$p['path']] = true;
+        }
+    }
+    $baseline = ProfileMeta::getBaseline($real);
+    if ($baseline) {
+        $keepPaths[$baseline] = true;
+    }
+
+    $toDelete = [];
+    foreach ($profiles as $idx => $p) {
+        if (isset($keepPaths[$p['path']])) {
+            continue;
+        }
+        // keepNewest already folded into $keepPaths
+        if ($keepDays > 0) {
+            if ($cutoff !== null && $p['mtime'] < $cutoff) {
+                $toDelete[] = $p;
+            }
+            continue;
+        }
+        if ($keepNewest > 0) {
+            $toDelete[] = $p;
+        }
+    }
+
+    $deleted = [];
+    $bytes = 0;
+    if (!$dryRun) {
+        foreach ($toDelete as $p) {
+            $cacheFile = cacheKeyForProfile($p['path']);
+            if (is_file($cacheFile)) {
+                @unlink($cacheFile);
+            }
+            if (@unlink($p['path'])) {
+                $deleted[] = $p['path'];
+                $bytes += $p['size'];
+            }
+        }
+    }
+
+    jsonOut([
+        'ok' => true,
+        'dir' => $real,
+        'dry_run' => $dryRun,
+        'candidates' => $toDelete,
+        'deleted' => $deleted,
+        'freed_bytes' => $bytes,
+        'kept_baseline' => $baseline,
+        'profile_count' => count($profiles),
+    ]);
+}
+
+if ($action === 'trend') {
+    $dir = (string) ($_POST['dir'] ?? '');
+    $limit = (int) ($_POST['limit'] ?? 20);
+    $limit = max(3, min(50, $limit));
+    if ($dir === '' || !isPathAllowed($dir) || !is_dir($dir)) {
+        jsonOut(['ok' => false, 'error' => 'Directory not allowed or missing.'], 400);
+    }
+    $real = realpath($dir);
+    $meta = ProfileMeta::loadForDir($real);
+    $points = [];
+    foreach (@scandir($real) ?: [] as $name) {
+        if (!isCachegrindName($name)) {
+            continue;
+        }
+        $full = $real . '/' . $name;
+        if (!is_file($full)) {
+            continue;
+        }
+        try {
+            $loaded = loadAnalyzer($full);
+            $rowMeta = is_array($meta['profiles'][$name] ?? null) ? $meta['profiles'][$name] : [];
+            $points[] = [
+                'path' => $full,
+                'name' => $name,
+                'label' => isset($rowMeta['label']) ? (string) $rowMeta['label'] : null,
+                'endpoint' => isset($rowMeta['endpoint']) ? (string) $rowMeta['endpoint'] : null,
+                'mtime' => (int) @filemtime($full),
+                'main_sec' => $loaded['analyzer']->mainSec(),
+                'size_bytes' => (int) @filesize($full),
+            ];
+        } catch (Throwable $e) {
+            // skip unreadable
+        }
+    }
+    usort($points, static fn ($a, $b) => $a['mtime'] <=> $b['mtime']);
+    $points = array_slice($points, -$limit);
+    jsonOut(['ok' => true, 'dir' => $real, 'points' => $points]);
 }
 
 function cacheKeyForProfile(string $realPath): string
@@ -179,6 +381,10 @@ if ($action === 'analyze') {
     $minSec = (float) ($_POST['min_sec'] ?? $_GET['min_sec'] ?? 0.05);
     $top = (int) ($_POST['top'] ?? $_GET['top'] ?? 40);
     $top = max(5, min(1000, $top));
+    $sortBy = (string) ($_POST['sort_by'] ?? $_GET['sort_by'] ?? 'incl');
+    if ($sortBy !== 'self') {
+        $sortBy = 'incl';
+    }
     $fnId = isset($_POST['fn_id']) ? (int) $_POST['fn_id'] : (isset($_GET['fn_id']) ? (int) $_GET['fn_id'] : null);
     $find = trim((string) ($_POST['find'] ?? $_GET['find'] ?? ''));
     $detailOnly = !empty($_POST['detail_only']) || !empty($_GET['detail_only']);
@@ -202,12 +408,19 @@ if ($action === 'analyze') {
             'parse_ms' => $loaded['parse_ms'],
             'cached' => $loaded['cached'],
             'main_sec' => $analyzer->mainSec(),
+            'sort_by' => $sortBy,
+            'meta' => ProfileMeta::get($real),
+            'baseline' => ProfileMeta::getBaseline(dirname($real)),
         ];
 
         if (!$detailOnly) {
             $payload['insights'] = $analyzer->insights();
-            $payload['top'] = $analyzer->topFunctions($minSec, $top);
+            $payload['top'] = $analyzer->topFunctions($minSec, $top, $sortBy);
             $payload['keywords'] = $analyzer->keywordHotspots();
+            $payload['modules'] = $analyzer->moduleRollup(max(0.005, $minSec / 2), min(60, $top));
+            $payload['plugins'] = $analyzer->pluginTax(max(0.01, $minSec / 2), min(60, $top));
+            $payload['flame'] = $analyzer->flameTree(8, 12, max(0.01, $minSec / 2));
+            $payload['apis'] = $analyzer->thirdPartyApis(max(0.02, $minSec / 2), min(80, max(40, $top)));
         }
 
         if ($fnId) {
@@ -243,11 +456,64 @@ if ($action === 'analyze') {
         if (!empty($payload['detail'])) {
             $payload['detail'] = SourceFileResolver::enrichDetail($payload['detail'], $projectRoot);
         }
+        if (!empty($payload['flame'])) {
+            $payload['flame'] = selfEnrichFlame($payload['flame'], $projectRoot);
+        }
+        if (!empty($payload['apis']['calls'])) {
+            foreach ($payload['apis']['calls'] as &$apiRow) {
+                if (!is_array($apiRow)) {
+                    continue;
+                }
+                $resolved = SourceFileResolver::resolve(
+                    isset($apiRow['file']) ? (string) $apiRow['file'] : null,
+                    (string) ($apiRow['name'] ?? ''),
+                    $projectRoot
+                );
+                if ($resolved) {
+                    $apiRow['file'] = $resolved;
+                }
+            }
+            unset($apiRow);
+        }
+        if (!empty($payload['plugins']['hotspots'])) {
+            $payload['plugins']['hotspots'] = SourceFileResolver::enrichRows(
+                $payload['plugins']['hotspots'],
+                $projectRoot
+            );
+        }
 
         jsonOut($payload);
     } catch (Throwable $e) {
         jsonOut(['ok' => false, 'error' => $e->getMessage()], 500);
     }
+}
+
+/**
+ * @param array<string, mixed> $node
+ * @return array<string, mixed>
+ */
+function selfEnrichFlame(array $node, ?string $projectRoot): array
+{
+    if (!empty($node['file']) || !empty($node['name'])) {
+        $resolved = SourceFileResolver::resolve(
+            isset($node['file']) ? (string) $node['file'] : null,
+            (string) ($node['name'] ?? ''),
+            $projectRoot
+        );
+        if ($resolved) {
+            $node['file'] = $resolved;
+        }
+    }
+    if (!empty($node['children']) && is_array($node['children'])) {
+        $kids = [];
+        foreach ($node['children'] as $child) {
+            if (is_array($child)) {
+                $kids[] = selfEnrichFlame($child, $projectRoot);
+            }
+        }
+        $node['children'] = $kids;
+    }
+    return $node;
 }
 
 if ($action === 'compare') {
@@ -487,6 +753,20 @@ if ($action === 'open') {
     color: var(--muted);
     position: sticky; top: 0; z-index: 1; background: #121820;
   }
+  .browser .crumb-nav {
+    display: flex;
+    gap: .35rem;
+    margin-bottom: .45rem;
+  }
+  .browser .crumb-back,
+  .browser .crumb-up {
+    font-size: .78rem;
+    padding: .25rem .55rem;
+  }
+  .browser .crumb-back:disabled {
+    opacity: .45;
+    cursor: not-allowed;
+  }
   .browser .crumb-path {
     display: block;
     color: var(--text);
@@ -549,9 +829,83 @@ if ($action === 'open') {
   tr.clickable:hover td { background: #1e2c40; }
   tr.active td { background: #274060; }
   .name { font-family: var(--mono); word-break: break-all; }
+  a.api-url {
+    font-family: var(--mono);
+    font-size: .78rem;
+    word-break: break-all;
+    overflow-wrap: anywhere;
+    color: var(--accent);
+  }
+  .api-endpoint { margin: 0 0 .45rem; }
+  .api-slug {
+    font-family: var(--mono);
+    font-size: .72rem;
+    color: #9fb3c8;
+    word-break: break-all;
+  }
   .tabs { display: flex; gap: .35rem; margin-bottom: .75rem; flex-wrap: wrap; }
   .tabs button.active { background: var(--accent); color: #061018; border-color: #2a7fd0; font-weight: 600; }
   .panel-scroll { max-height: 480px; overflow: auto; }
+  .analyze-progress {
+    margin: .65rem 0 0;
+    display: none;
+  }
+  .analyze-progress.active { display: block; }
+  .analyze-progress .bar {
+    height: 6px;
+    border-radius: 999px;
+    background: #1a2430;
+    overflow: hidden;
+  }
+  .analyze-progress .bar > span {
+    display: block;
+    height: 100%;
+    width: 40%;
+    border-radius: 999px;
+    background: linear-gradient(90deg, var(--accent), #7dcea0);
+    animation: bn-slide 1.2s ease-in-out infinite;
+  }
+  .analyze-progress .lbl {
+    margin-top: .35rem;
+    font-size: .78rem;
+    color: var(--muted);
+  }
+  @keyframes bn-slide {
+    0% { transform: translateX(-120%); }
+    100% { transform: translateX(320%); }
+  }
+  .endpoint-groups {
+    margin: .35rem 0 .6rem;
+    padding: .5rem .65rem;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: #121820;
+  }
+  .endpoint-groups h3 {
+    margin: 0 0 .4rem;
+    font-size: .78rem;
+    font-weight: 600;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: .04em;
+  }
+  .endpoint-group {
+    display: flex;
+    flex-wrap: wrap;
+    gap: .35rem;
+    align-items: center;
+    margin: .3rem 0;
+    font-size: .82rem;
+  }
+  .endpoint-group .ep {
+    color: #7db3e0;
+    font-family: ui-monospace, monospace;
+    font-size: .78rem;
+  }
+  .endpoint-group button {
+    font-size: .72rem;
+    padding: .15rem .45rem;
+  }
   .load-more {
     display: flex;
     align-items: center;
@@ -577,7 +931,31 @@ if ($action === 'open') {
   .empty { color: var(--muted); font-size: .9rem; padding: 1rem 0; }
   .err { color: var(--danger); margin: .5rem 0; font-size: .9rem; }
   .hint { font-size: .78rem; color: var(--muted); margin-top: .5rem; line-height: 1.4; }
-  .detail-title { font-family: var(--mono); font-size: .85rem; word-break: break-all; margin: 0 0 .75rem; color: var(--accent); }
+  .detail-toolbar {
+    display: flex;
+    align-items: flex-start;
+    gap: .65rem;
+    margin: 0 0 .75rem;
+  }
+  .detail-back {
+    flex-shrink: 0;
+    font-size: .78rem;
+    padding: .25rem .55rem;
+    margin-top: .1rem;
+  }
+  .detail-back:disabled {
+    opacity: .45;
+    cursor: not-allowed;
+  }
+  .detail-title {
+    font-family: var(--mono);
+    font-size: .85rem;
+    word-break: break-all;
+    margin: 0;
+    color: var(--accent);
+    flex: 1;
+    min-width: 0;
+  }
   .hidden { display: none; }
   a.file-open {
     color: var(--muted);
@@ -641,6 +1019,47 @@ if ($action === 'open') {
     padding: .35rem 0;
   }
   .source-stat .l { margin-top: .4rem; }
+  .meta-box {
+    margin: .5rem 0 .75rem;
+    padding: .65rem .75rem;
+    border: 1px solid var(--border, #2a3540);
+    border-radius: 8px;
+    background: rgba(255,255,255,.02);
+  }
+  .choose-actions { display: flex; flex-wrap: wrap; gap: .4rem; align-items: center; }
+  .scope-tag {
+    display: inline-block;
+    font-size: .65rem;
+    padding: .1rem .35rem;
+    border-radius: 4px;
+    margin-right: .35rem;
+    background: #243044;
+    color: #9fb3c8;
+    text-transform: uppercase;
+  }
+  .scope-tag.app { background: #1a3a2a; color: #7dcea0; }
+  .scope-tag.vendor { background: #3a2a1a; color: #e0b070; }
+  .scope-tag.framework { background: #2a1a3a; color: #c09be0; }
+  .scope-tag.php { background: #1a2a3a; color: #7db3e0; }
+  .flame-wrap { overflow-x: auto; padding: .5rem 0; }
+  .flame-wrap svg { display: block; min-width: 100%; }
+  .flame-wrap rect { cursor: pointer; stroke: #0f1419; stroke-width: .5; }
+  .flame-wrap rect:hover { filter: brightness(1.15); }
+  .flame-tip { font-size: .8rem; color: #9fb3c8; margin: .35rem 0 .75rem; }
+  .trend-bar {
+    display: flex; align-items: flex-end; gap: 4px; height: 140px;
+    padding: .5rem 0 1.5rem; border-bottom: 1px solid #2a3540;
+  }
+  .trend-col { flex: 1; min-width: 18px; display: flex; flex-direction: column; justify-content: flex-end; align-items: center; }
+  .trend-col .bar { width: 100%; background: #3d8bfd; border-radius: 3px 3px 0 0; min-height: 2px; }
+  .trend-col .lbl { font-size: .6rem; color: #8a9bb0; margin-top: .25rem; writing-mode: vertical-rl; transform: rotate(180deg); max-height: 70px; overflow: hidden; }
+  .item .badge {
+    font-size: .65rem; padding: .05rem .3rem; border-radius: 3px;
+    background: #243044; color: #9fb3c8; margin-left: .35rem;
+  }
+  .item .badge.baseline { background: #3a2a10; color: #e0b070; }
+  .item .badge.endpoint { background: #1a2a3a; color: #7db3e0; }
+  button.hidden { display: none !important; }
 </style>
 </head>
 <body>
@@ -670,6 +1089,23 @@ if ($action === 'open') {
             <input type="number" id="topN" value="40" min="5" max="1000" step="10">
           </div>
           <div>
+            <label>Time metric</label>
+            <select id="sortBy">
+              <option value="incl" selected>Inclusive</option>
+              <option value="self">Self time</option>
+            </select>
+          </div>
+          <div>
+            <label>Scope filter</label>
+            <select id="scopeFilter">
+              <option value="all">All</option>
+              <option value="app" selected>App only</option>
+              <option value="hide_vendor">Hide vendor</option>
+              <option value="vendor">Vendor only</option>
+              <option value="framework">Framework</option>
+            </select>
+          </div>
+          <div>
             <label>Editor</label>
             <select id="editorApp">
               <option value="cursor" selected>Cursor</option>
@@ -686,6 +1122,28 @@ if ($action === 'open') {
             </select>
           </div>
         </div>
+        <div class="meta-box" id="metaBox">
+          <div class="row">
+            <div>
+              <label>Label</label>
+              <input type="text" id="metaLabel" placeholder="e.g. checkout before session fix">
+            </div>
+            <div>
+              <label>Endpoint</label>
+              <input type="text" id="metaEndpoint" placeholder="/rest/V1/... or checkout/totals">
+            </div>
+            <div>
+              <label>Method</label>
+              <input type="text" id="metaMethod" placeholder="GET / POST">
+            </div>
+          </div>
+          <div class="row">
+            <div style="flex:1">
+              <label>Notes</label>
+              <input type="text" id="metaNotes" placeholder="Optional notes for this profile">
+            </div>
+          </div>
+        </div>
         <div class="row">
           <div class="path-field" data-target="pathBefore">
             <label>Compare before</label>
@@ -699,6 +1157,18 @@ if ($action === 'open') {
         <div class="choose-actions">
           <button type="button" class="primary" id="btnAnalyze">Analyze</button>
           <button type="button" id="btnCompare">Compare</button>
+          <button type="button" id="btnSaveMeta">Save label</button>
+          <button type="button" id="btnBaseline">Set baseline</button>
+          <button type="button" id="btnCompareBaseline">vs baseline</button>
+          <button type="button" id="btnExport">Export HTML</button>
+          <button type="button" id="btnExportJson" title="Download JSON">JSON</button>
+          <button type="button" id="btnAiPrompt">Copy AI prompt</button>
+          <button type="button" id="btnCleanup">Cleanup…</button>
+          <button type="button" id="btnCancelAnalyze" class="hidden">Cancel</button>
+        </div>
+        <div class="analyze-progress" id="analyzeProgress" aria-live="polite">
+          <div class="bar"><span></span></div>
+          <div class="lbl" id="analyzeProgressLbl">Parsing profile… large files can take 1–3 minutes. Use Cancel to abort.</div>
         </div>
         <p class="hint">
           Allowed roots: <code>/var/www/html</code>, <code>/tmp</code>.
@@ -736,13 +1206,30 @@ if ($action === 'open') {
     <section class="card" style="margin-top:1rem">
       <div class="tabs">
         <button type="button" class="active" data-tab="top">Top functions</button>
+        <button type="button" data-tab="modules">Modules</button>
+        <button type="button" data-tab="plugins">Plugins</button>
+        <button type="button" data-tab="apis">3rd-party APIs</button>
+        <button type="button" data-tab="flame">Flame</button>
         <button type="button" data-tab="kw">Keyword hotspots</button>
         <button type="button" data-tab="detail">Backtrace / callers</button>
         <button type="button" data-tab="compare">Compare</button>
+        <button type="button" data-tab="trend">Trend</button>
       </div>
 
       <div id="tab-top" class="panel-scroll">
         <div class="empty">No data yet.</div>
+      </div>
+      <div id="tab-modules" class="panel-scroll hidden">
+        <div class="empty">Run Analyze to see Vendor\\Module rollup (self-time).</div>
+      </div>
+      <div id="tab-plugins" class="panel-scroll hidden">
+        <div class="empty">Run Analyze to see Interceptor / Plugin / PluginList tax.</div>
+      </div>
+      <div id="tab-apis" class="panel-scroll hidden">
+        <div class="empty">Run Analyze — HTTP call sites are read from this Cachegrind profile only.</div>
+      </div>
+      <div id="tab-flame" class="panel-scroll hidden">
+        <div class="empty">Run Analyze to see the call-tree flame / icicle chart.</div>
       </div>
       <div id="tab-kw" class="panel-scroll hidden">
         <div class="empty">No data yet.</div>
@@ -765,11 +1252,14 @@ if ($action === 'open') {
       <div id="tab-compare" class="panel-scroll hidden">
         <div class="empty">Set Before + After paths, then click Compare. Negative delta = faster.</div>
       </div>
+      <div id="tab-trend" class="panel-scroll hidden">
+        <div class="empty">Open a profiler folder, then click Trend to chart {main} across recent profiles.</div>
+      </div>
     </section>
   </main>
 </div>
 
-<script src="app.js?v=20260712y"></script>
+<script src="app.js?v=20260713j"></script>
 
 </body>
 </html>
