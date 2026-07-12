@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+
+URL="$1"
+
+URL="${URL#cursor://}"
+URL="${URL#open?}"
+
+FILE=$(echo "$URL" | sed -n 's/.*file=\([^&]*\).*/\1/p')
+LINE=$(echo "$URL" | sed -n 's/.*line=\([^&]*\).*/\1/p')
+
+decode() {
+    python3 -c "import urllib.parse, sys; print(urllib.parse.unquote(sys.argv[1] if len(sys.argv) > 1 else ''))" "$1"
+}
+
+FILE=$(decode "$FILE")
+LINE=$(decode "$LINE")
+
+if [ -z "$FILE" ]; then
+    exit 1
+fi
+
+if [ -n "$LINE" ]; then
+    exec cursor -g "${FILE}:${LINE}"
+else
+    exec cursor "$FILE"
+fi
