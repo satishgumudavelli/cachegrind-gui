@@ -4,6 +4,8 @@ Web UI to browse Xdebug **Cachegrind** profiles, find slow functions, compare be
 
 **URL:** `http://localhost/bottleneck/` (or your vhost that serves `/var/www/html`)
 
+In the app header, click **README** to open this doc in a new tab (`?action=readme`).
+
 **Repo:** [satishgumudavelli/cachegrind-gui](https://github.com/satishgumudavelli/cachegrind-gui)
 
 ---

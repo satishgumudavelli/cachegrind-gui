@@ -643,6 +643,191 @@ if ($action === 'open') {
     ]);
 }
 
+/**
+ * Minimal Markdown → HTML for README.md (no external dependency).
+ */
+function markdownToHtml(string $md): string
+{
+    $md = str_replace(["\r\n", "\r"], "\n", $md);
+    $parts = preg_split('/(```[\s\S]*?```)/', $md, -1, PREG_SPLIT_DELIM_CAPTURE);
+    $html = '';
+    foreach ($parts ?: [] as $part) {
+        if ($part === '') {
+            continue;
+        }
+        if (preg_match('/^```(\w*)\n?([\s\S]*?)```$/s', $part, $m)) {
+            $code = htmlspecialchars(rtrim($m[2], "\n"), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+            $lang = $m[1] !== '' ? ' data-lang="' . htmlspecialchars($m[1], ENT_QUOTES, 'UTF-8') . '"' : '';
+            $html .= '<pre><code' . $lang . '>' . $code . '</code></pre>';
+            continue;
+        }
+        $html .= markdownBlocksToHtml($part);
+    }
+    return $html;
+}
+
+function markdownInline(string $text): string
+{
+    $text = htmlspecialchars($text, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+    $text = preg_replace_callback(
+        '/\[([^\]]+)\]\(([^)\s]+)\)/',
+        static function (array $m): string {
+            $label = $m[1];
+            $href = html_entity_decode($m[2], ENT_QUOTES, 'UTF-8');
+            if (!preg_match('#^https?://#i', $href)) {
+                // Relative paths: keep readable without a broken link
+                return '<strong>' . $label . '</strong>';
+            }
+            return '<a href="' . htmlspecialchars($href, ENT_QUOTES, 'UTF-8')
+                . '" target="_blank" rel="noopener noreferrer">' . $label . '</a>';
+        },
+        $text
+    ) ?? $text;
+    $text = preg_replace('/\*\*([^*]+)\*\*/', '<strong>$1</strong>', $text) ?? $text;
+    $text = preg_replace('/`([^`]+)`/', '<code>$1</code>', $text) ?? $text;
+    return $text;
+}
+
+function markdownBlocksToHtml(string $text): string
+{
+    $lines = explode("\n", $text);
+    $out = '';
+    $i = 0;
+    $n = count($lines);
+    while ($i < $n) {
+        $line = $lines[$i];
+        $trim = rtrim($line);
+
+        if ($trim === '') {
+            $i++;
+            continue;
+        }
+
+        if (preg_match('/^---+$/', $trim)) {
+            $out .= '<hr>';
+            $i++;
+            continue;
+        }
+
+        if (preg_match('/^(#{1,3})\s+(.+)$/', $trim, $m)) {
+            $lvl = strlen($m[1]);
+            $out .= '<h' . $lvl . '>' . markdownInline($m[2]) . '</h' . $lvl . '>';
+            $i++;
+            continue;
+        }
+
+        // Table
+        if (str_contains($trim, '|') && $i + 1 < $n && preg_match('/^\|?\s*:?-{3,}/', $lines[$i + 1])) {
+            $rows = [];
+            while ($i < $n && str_contains($lines[$i], '|') && trim($lines[$i]) !== '') {
+                $rows[] = $lines[$i];
+                $i++;
+            }
+            if (count($rows) >= 2) {
+                $parseRow = static function (string $row): array {
+                    $row = trim($row);
+                    $row = trim($row, '|');
+                    return array_map('trim', explode('|', $row));
+                };
+                $head = $parseRow($rows[0]);
+                $out .= '<table><thead><tr>';
+                foreach ($head as $cell) {
+                    $out .= '<th>' . markdownInline($cell) . '</th>';
+                }
+                $out .= '</tr></thead><tbody>';
+                for ($r = 2; $r < count($rows); $r++) {
+                    if (preg_match('/^\|?\s*:?-{3,}/', $rows[$r])) {
+                        continue;
+                    }
+                    $cells = $parseRow($rows[$r]);
+                    $out .= '<tr>';
+                    foreach ($cells as $cell) {
+                        $out .= '<td>' . markdownInline($cell) . '</td>';
+                    }
+                    $out .= '</tr>';
+                }
+                $out .= '</tbody></table>';
+            }
+            continue;
+        }
+
+        // Unordered list
+        if (preg_match('/^\s*[-*]\s+(.+)$/', $trim, $m)) {
+            $out .= '<ul>';
+            while ($i < $n && preg_match('/^\s*[-*]\s+(.+)$/', rtrim($lines[$i]), $lm)) {
+                $out .= '<li>' . markdownInline($lm[1]) . '</li>';
+                $i++;
+            }
+            $out .= '</ul>';
+            continue;
+        }
+
+        // Ordered list
+        if (preg_match('/^\s*\d+\.\s+(.+)$/', $trim, $m)) {
+            $out .= '<ol>';
+            while ($i < $n && preg_match('/^\s*\d+\.\s+(.+)$/', rtrim($lines[$i]), $lm)) {
+                $out .= '<li>' . markdownInline($lm[1]) . '</li>';
+                $i++;
+            }
+            $out .= '</ol>';
+            continue;
+        }
+
+        // Paragraph (consume consecutive non-blank, non-special lines)
+        $buf = [$trim];
+        $i++;
+        while ($i < $n) {
+            $next = rtrim($lines[$i]);
+            if ($next === '' || preg_match('/^(#{1,3}\s|---|[-*]\s|\d+\.\s|```)/', $next) || (str_contains($next, '|') && $i + 1 < $n && preg_match('/^\|?\s*:?-{3,}/', $lines[$i + 1]))) {
+                break;
+            }
+            $buf[] = $next;
+            $i++;
+        }
+        $out .= '<p>' . markdownInline(implode(' ', $buf)) . '</p>';
+    }
+    return $out;
+}
+
+if ($action === 'readme' || $action === 'docs') {
+    $path = __DIR__ . '/README.md';
+    $md = is_file($path) ? (string) file_get_contents($path) : "# README missing\n\nCould not load `README.md`.";
+    $body = markdownToHtml($md);
+    $self = htmlspecialchars((string) ($_SERVER['SCRIPT_NAME'] ?? 'index.php'), ENT_QUOTES, 'UTF-8');
+    header('Content-Type: text/html; charset=utf-8');
+    echo '<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">';
+    echo '<meta name="viewport" content="width=device-width, initial-scale=1">';
+    echo '<title>Bottleneck — README</title>';
+    echo '<style>
+:root{--bg:#0f1419;--panel:#1a2332;--border:#2f3f55;--text:#e7eef8;--muted:#8fa3b8;--accent:#3d9cf0;--mono:"JetBrains Mono","Fira Code",ui-monospace,monospace;--sans:"Source Sans 3","Segoe UI",system-ui,sans-serif}
+*{box-sizing:border-box}
+body{margin:0;font-family:var(--sans);background:var(--bg);color:var(--text);line-height:1.55}
+.bar{display:flex;justify-content:space-between;align-items:center;gap:1rem;padding:.85rem 1.25rem;border-bottom:1px solid var(--border);background:rgba(15,20,25,.92);position:sticky;top:0;backdrop-filter:blur(8px)}
+.bar a{color:var(--accent);text-decoration:none;font-size:.9rem}
+.bar a:hover{text-decoration:underline}
+.wrap{max-width:860px;margin:0 auto;padding:1.25rem 1.5rem 3rem}
+h1{font-size:1.55rem;margin:0 0 .75rem}
+h2{font-size:1.15rem;margin:1.75rem 0 .65rem;padding-bottom:.35rem;border-bottom:1px solid var(--border)}
+h3{font-size:1rem;margin:1.25rem 0 .5rem;color:#c5d4e4}
+p,li{color:#d5e0ec}
+a{color:var(--accent)}
+code{font-family:var(--mono);font-size:.86em;background:#121820;padding:.1rem .35rem;border-radius:4px;border:1px solid var(--border)}
+pre{background:#121820;border:1px solid var(--border);border-radius:8px;padding:.85rem 1rem;overflow:auto}
+pre code{background:none;border:0;padding:0;font-size:.82rem}
+table{border-collapse:collapse;width:100%;margin:.75rem 0 1.25rem;font-size:.9rem}
+th,td{border:1px solid var(--border);padding:.45rem .6rem;text-align:left;vertical-align:top}
+th{background:var(--panel);color:#c5d4e4}
+hr{border:0;border-top:1px solid var(--border);margin:1.5rem 0}
+ul,ol{padding-left:1.25rem}
+strong{color:#fff}
+.muted{color:var(--muted);font-size:.85rem}
+</style></head><body>';
+    echo '<div class="bar"><strong>Bottleneck docs</strong><span><a href="' . $self . '">← Back to analyzer</a></span></div>';
+    echo '<div class="wrap">' . $body . '<p class="muted">Rendered from README.md</p></div>';
+    echo '</body></html>';
+    exit;
+}
+
 ?>
 <!DOCTYPE html>
 <html lang="en">
@@ -682,8 +867,25 @@ if ($action === 'open') {
     backdrop-filter: blur(8px);
     position: sticky; top: 0; z-index: 10;
   }
+  header .header-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 1rem;
+  }
   header h1 { margin: 0; font-size: 1.25rem; font-weight: 650; letter-spacing: .02em; }
   header p { margin: .35rem 0 0; color: var(--muted); font-size: .9rem; }
+  header .doc-link {
+    flex-shrink: 0;
+    color: var(--accent);
+    text-decoration: none;
+    font-size: .88rem;
+    padding: .35rem .65rem;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--panel);
+  }
+  header .doc-link:hover { filter: brightness(1.1); border-color: var(--accent); }
   .wrap { display: flex; flex-direction: column; gap: 1rem; padding: 1rem 1.5rem 2rem; max-width: 1600px; margin: 0 auto; width: 100%; }
   .card-choose { width: 100%; }
   .choose-grid {
@@ -1064,8 +1266,13 @@ if ($action === 'open') {
 </head>
 <body>
 <header>
-  <h1>PHP Bottleneck Analyzer</h1>
-  <p>Select a local <code>cachegrind.out.*</code> path on this server (browse only — no upload). Built for Xdebug profiles.</p>
+  <div class="header-row">
+    <div>
+      <h1>PHP Bottleneck Analyzer</h1>
+      <p>Select a local <code>cachegrind.out.*</code> path on this server (browse only — no upload). Built for Xdebug profiles.</p>
+    </div>
+    <a class="doc-link" href="?action=readme" target="_blank" rel="noopener noreferrer" title="Open README in a new tab">README</a>
+  </div>
 </header>
 
 <div class="wrap">
