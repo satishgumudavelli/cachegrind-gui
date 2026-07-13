@@ -3,7 +3,7 @@
   let lastResult = null;
   let lastCompare = null;
   let lastBrowse = null;
-  let browseDir = '/var/www/html/blackwoodcabinet-upgrade/var/profiler';
+  let browseDir = '/var/www/html/bottleneck/profiler';
   let analyzeAbort = null;
   /** Previous browse folders for Back button (most recent at end). */
   const browseHistory = [];

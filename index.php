@@ -48,6 +48,56 @@ function isPathAllowed(string $path): bool
     return false;
 }
 
+/** True if $path would sit under an allowed root even when the path does not exist yet. */
+function isPathUnderAllowedRoots(string $path): bool
+{
+    $norm = rtrim(str_replace('\\', '/', $path), '/');
+    if ($norm === '') {
+        return false;
+    }
+    foreach (ALLOWED_ROOTS as $root) {
+        $rootReal = realpath($root);
+        if ($rootReal === false) {
+            continue;
+        }
+        $rootNorm = rtrim(str_replace('\\', '/', $rootReal), '/');
+        if ($norm === $rootNorm || str_starts_with($norm, $rootNorm . '/')) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * Create a missing profiler directory when safe:
+ * - path basename is "profiler" (e.g. …/var/profiler or bottleneck/profiler)
+ * - path is under ALLOWED_ROOTS
+ * - parent directory already exists and is allowed
+ */
+function ensureProfilerDir(string $dir): bool
+{
+    $dir = rtrim(str_replace('\\', '/', $dir), '/');
+    if ($dir === '' || is_dir($dir)) {
+        return is_dir($dir);
+    }
+    if (basename($dir) !== 'profiler' || !isPathUnderAllowedRoots($dir)) {
+        return false;
+    }
+    $parent = dirname($dir);
+    if (!is_dir($parent) || !isPathAllowed($parent)) {
+        return false;
+    }
+    if (!@mkdir($dir, 0775, true) && !is_dir($dir)) {
+        return false;
+    }
+    // Best-effort writable for the web / CLI user that runs Xdebug
+    @chmod($dir, 0775);
+    return true;
+}
+
+// Default Bottleneck profile drop folder
+ensureProfilerDir(__DIR__ . '/profiler');
+
 function isCachegrindName(string $name): bool
 {
     return (bool) preg_match('/^cachegrind\.out/i', $name);
@@ -69,6 +119,10 @@ function isBrowsableFile(string $name, bool $isDir): bool
 
 if ($action === 'browse' || $action === 'list_dir') {
     $dir = (string) ($_POST['dir'] ?? $_GET['dir'] ?? '/var/www/html');
+    // Auto-create missing …/profiler folders under allowed roots (e.g. Magento var/profiler)
+    if (!is_dir($dir)) {
+        ensureProfilerDir($dir);
+    }
     if (!isPathAllowed($dir) || !is_dir($dir)) {
         jsonOut(['ok' => false, 'error' => 'Directory not allowed or missing.'], 400);
     }
@@ -1283,7 +1337,7 @@ strong{color:#fff}
         <div class="row">
           <div class="path-field" data-target="path">
             <label>Server path (Analyze)</label>
-            <input type="text" id="path" placeholder="/var/www/html/.../var/profiler/cachegrind.out.xxx" value="/var/www/html/blackwoodcabinet-upgrade/var/profiler">
+            <input type="text" id="path" placeholder="/var/www/html/.../var/profiler/cachegrind.out.xxx" value="/var/www/html/bottleneck/profiler">
           </div>
         </div>
         <div class="row">

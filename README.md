@@ -42,14 +42,14 @@ php --ini
 Prefer **trigger** so normal browsing stays fast; only profile when you ask for it:
 
 ```ini
-zend_extension=xdebug
+zend_extension=xdebug.so
 
 xdebug.mode=profile
 xdebug.start_with_request=trigger
-xdebug.output_dir=/tmp
-xdebug.profiler_output_name=cachegrind.out.%p.%t
+xdebug.output_dir=/var/www/html/bottleneck/profiler
+xdebug.profiler_output_name=cachegrind.out.%u.%r
 ; Bottleneck reads plain text Cachegrind — disable gz compression
-xdebug.use_compression=0
+xdebug.use_compression=false
 ```
 
 | Setting | Notes |
@@ -73,6 +73,7 @@ mkdir -p /var/www/html/your-project/var/profiler
 chmod 777 /var/www/html/your-project/var/profiler   # or chown to www-data
 ```
 
+Bottleneck also auto-creates a missing folder named `profiler` when you browse to it (parent must already exist under an allowed root), and ensures `/var/www/html/bottleneck/profiler` on load.
 Restart PHP-FPM / Apache after editing ini:
 
 ```bash
