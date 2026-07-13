@@ -13,22 +13,124 @@ In the app header, click **README** to open this doc in a new tab (`?action=read
 ## Requirements
 
 - PHP 8+ with web server (Apache/nginx) serving `/var/www/html`
-- Xdebug configured to write Cachegrind output, e.g.:
-
-  ```ini
-  xdebug.mode=profile
-  xdebug.output_dir=/tmp
-  ```
-
+- [Xdebug 3+](https://xdebug.org/) with **profile** mode (see below)
 - Readable profile paths under allowed roots:
   - `/var/www/html`
   - `/tmp`
 
 ---
 
+## Xdebug setup (profiling)
+
+Bottleneck reads Xdebug **Cachegrind** files (`cachegrind.out.*`). Configure Xdebug **3** (not the old `xdebug.profiler_enable` settings).
+
+### 1. Confirm Xdebug is loaded
+
+```bash
+php -v | grep -i xdebug
+php -i | grep -E 'xdebug.(mode|output_dir|start_with_request)'
+```
+
+Find the active ini (often `/etc/php/*/mods-available/xdebug.ini` or a `conf.d/20-xdebug.ini`):
+
+```bash
+php --ini
+```
+
+### 2. Recommended php.ini (trigger mode)
+
+Prefer **trigger** so normal browsing stays fast; only profile when you ask for it:
+
+```ini
+zend_extension=xdebug
+
+xdebug.mode=profile
+xdebug.start_with_request=trigger
+xdebug.output_dir=/tmp
+xdebug.profiler_output_name=cachegrind.out.%p.%t
+; Bottleneck reads plain text Cachegrind — disable gz compression
+xdebug.use_compression=0
+```
+
+| Setting | Notes |
+|---------|--------|
+| `xdebug.mode=profile` | Enables the profiler (can combine: `develop,profile`) |
+| `xdebug.start_with_request=trigger` | Profile only when triggered (recommended) |
+| `xdebug.output_dir` | Must exist and be **writable** by the PHP / web-server user |
+| `xdebug.profiler_output_name` | Must start with `cachegrind.out` — Bottleneck filters on that name |
+| `xdebug.use_compression=0` | Avoid `.gz` profiles; this app opens uncompressed files |
+
+**Magento tip:** point output at the project profiler folder so profiles sit next to the code tree:
+
+```ini
+xdebug.output_dir=/var/www/html/your-project/var/profiler
+```
+
+Create it and make it writable:
+
+```bash
+mkdir -p /var/www/html/your-project/var/profiler
+chmod 777 /var/www/html/your-project/var/profiler   # or chown to www-data
+```
+
+Restart PHP-FPM / Apache after editing ini:
+
+```bash
+sudo systemctl restart php8.2-fpm   # adjust version
+# or: sudo systemctl restart apache2
+```
+
+### 3. Trigger a profile
+
+With `start_with_request=trigger`, start one request with any of:
+
+| Method | Example |
+|--------|---------|
+| Query string | `https://shop.local/checkout/?XDEBUG_TRIGGER=1` |
+| Legacy query | `?XDEBUG_PROFILE=1` |
+| Cookie | `XDEBUG_TRIGGER=1` (browser extensions / Xdebug helper) |
+| CLI env | `XDEBUG_TRIGGER=1 php bin/magento …` |
+
+Optional lock so only your secret triggers profiling:
+
+```ini
+xdebug.trigger_value=StartProfileForMe
+```
+
+Then use `?XDEBUG_TRIGGER=StartProfileForMe`.
+
+**Always-on** (every request — heavy; local only):
+
+```ini
+xdebug.mode=profile
+xdebug.start_with_request=yes
+```
+
+### 4. Verify a file was written
+
+```bash
+ls -lt /tmp/cachegrind.out.* | head
+# or Magento:
+ls -lt /var/www/html/your-project/var/profiler/cachegrind.out.* | head
+```
+
+If nothing appears: check `output_dir` permissions, that FPM/Apache picked up the ini (`php-fpm` vs CLI can differ), and that the trigger was present on the **first** request (not only on AJAX follow-ups unless those are triggered too).
+
+### 5. Open in Bottleneck
+
+1. Open `http://localhost/bottleneck/`
+2. Browse to the `output_dir` (or paste the full `cachegrind.out.*` path)
+3. Click **Analyze**
+
+Profiling **inflates** wall time vs production — use deltas / baseline compares, not absolute seconds, when judging fixes.
+
+Official docs: [Xdebug Profiling](https://xdebug.dev/docs/profiler)
+
+---
+
 ## Quick start
 
-1. Generate a profile (trigger a slow request with Xdebug profiling on).
+1. Configure Xdebug (section above) and generate a profile for a slow request.
 2. Open `http://localhost/bottleneck/`.
 3. Browse to the `cachegrind.out.*` file (often under `/tmp` or `var/profiler`).
 4. Click **Analyze** to see the slowest functions, modules, plugins, and flame chart.
