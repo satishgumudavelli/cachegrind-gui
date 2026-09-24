@@ -338,6 +338,133 @@ final class CachegrindAnalyzer
     }
 
     /**
+     * Generic N+1 detector: single caller -> callee edges with a high call count.
+     * Unlike keywordHotspots(), this needs no name list — it flags any repeated
+     * call site (product load, address lookup, config fetch, ...) by shape alone.
+     *
+     * @return list<array{caller:string,callee:string,calls:int,sec:float}>
+     */
+    public function repeatedCallSites(float $minSec = 0.05, int $minCalls = 10, int $limit = 5): array
+    {
+        // Keyed by callee name: Magento interceptors record the same real call twice
+        // (->___callParent and back), so keep only the costliest edge per callee.
+        $byCallee = [];
+        foreach ($this->callees as $callerId => $edges) {
+            foreach ($edges as $calleeId => $edge) {
+                $sec = self::ticksToSec($edge['ticks']);
+                if ($edge['calls'] < $minCalls || $sec < $minSec) {
+                    continue;
+                }
+                $callee = $this->idToName[$calleeId] ?? ('#' . $calleeId);
+                // Interceptor plumbing (___callParent/___callPlugins) as the callee is just the
+                // "return to parent" bookkeeping hop of a call already reported the other direction.
+                if (preg_match('/->___call(Parent|Plugins)$/', $callee)) {
+                    continue;
+                }
+                if (isset($byCallee[$callee]) && $byCallee[$callee]['sec'] >= $sec) {
+                    continue;
+                }
+                $byCallee[$callee] = [
+                    'caller' => $this->idToName[$callerId] ?? ('#' . $callerId),
+                    'callee' => $callee,
+                    'calls' => $edge['calls'],
+                    'sec' => $sec,
+                ];
+            }
+        }
+        $rows = array_values($byCallee);
+        usort($rows, static fn ($a, $b) => $b['sec'] <=> $a['sec']);
+        return array_slice($rows, 0, $limit);
+    }
+
+    /** @var array<string, string> patternKey => /regex/ over function name, aggregated across ALL call sites */
+    private const CHURN_PATTERNS = [
+        'db_query' => '/(PDOStatement->execute|Zend_Db_(Statement|Adapter)\S*->query|->_execute\b)/',
+        'object_create' => '/(ObjectManager\S*->create|Factory\S*->create(Object)?)\b/',
+        'eav_attribute_load' => '/Eav\\\\Model\\\\Config->(getAttribute|getEntityType)\b/',
+    ];
+
+    /**
+     * Fan-in churn detector: total calls to a name pattern summed across every
+     * caller (unlike repeatedCallSites(), no single edge need be large). Catches
+     * "chatty DB", object-instantiation overhead, and EAV attribute N+1 fan-out.
+     *
+     * @return list<array{pattern:string,name:string,calls:int,sec:float}>
+     */
+    public function churnHotspots(int $minCalls = 500, float $minSec = 0.1): array
+    {
+        $agg = [];
+        foreach (self::CHURN_PATTERNS as $pattern => $regex) {
+            $agg[$pattern] = ['calls' => 0, 'ticks' => 0, 'names' => []];
+        }
+        foreach ($this->idToName as $id => $name) {
+            foreach (self::CHURN_PATTERNS as $pattern => $regex) {
+                if (preg_match($regex, $name)) {
+                    $agg[$pattern]['calls'] += $this->calls[$id] ?? 0;
+                    $agg[$pattern]['ticks'] += $this->incl[$id] ?? 0;
+                    $agg[$pattern]['names'][] = $name;
+                }
+            }
+        }
+        $rows = [];
+        foreach ($agg as $pattern => $data) {
+            $sec = self::ticksToSec($data['ticks']);
+            if ($data['calls'] < $minCalls || $sec < $minSec) {
+                continue;
+            }
+            $rows[] = [
+                'pattern' => $pattern,
+                'name' => $this->shortName(implode(', ', array_unique($data['names']))),
+                'calls' => $data['calls'],
+                'sec' => $sec,
+            ];
+        }
+        usort($rows, static fn ($a, $b) => $b['sec'] <=> $a['sec']);
+        return $rows;
+    }
+
+    /**
+     * Duplicate-dispatch detector: a project/custom controller or action entry
+     * point (->execute) invoked more than once inside one profile. A single
+     * request should hit its own controller action exactly once — 2+ means
+     * something on the front end (or a retry) re-triggered the same endpoint.
+     * Framework/vendor-Magento internals and generated Interceptor plumbing are
+     * excluded since plugin-chain closures legitimately fire multiple times.
+     *
+     * @return list<array{name:string,calls:int,sec:float}>
+     */
+    public function duplicateDispatches(int $minCalls = 2): array
+    {
+        $rows = [];
+        foreach ($this->idToName as $id => $name) {
+            if (!str_ends_with($name, '->execute') || str_contains($name, '___call')) {
+                continue;
+            }
+            // Magento controller actions live under a \Controller\ namespace segment;
+            // this excludes ObserverInterface::execute() and other unrelated ->execute() methods,
+            // which legitimately run once per row/item and aren't dispatch entry points.
+            if (!preg_match('#[\\\\/]Controller[\\\\/]#', $name) && !preg_match('#[\\\\/]Controller[\\\\/]#', $this->fnToFile[$id] ?? '')) {
+                continue;
+            }
+            $calls = $this->calls[$id] ?? 0;
+            if ($calls < $minCalls) {
+                continue;
+            }
+            $scope = self::classifyScope($this->resolveFile($id, $name), $name);
+            if ($scope === 'framework' || $scope === 'php') {
+                continue;
+            }
+            $rows[] = [
+                'name' => $name,
+                'calls' => $calls,
+                'sec' => self::ticksToSec($this->incl[$id] ?? 0),
+            ];
+        }
+        usort($rows, static fn ($a, $b) => $b['sec'] <=> $a['sec']);
+        return $rows;
+    }
+
+    /**
      * Roll up time spent in Magento Interceptors, Plugins, and PluginList plumbing.
      *
      * @return array{
@@ -878,16 +1005,44 @@ final class CachegrindAnalyzer
             }
         }
 
-        if ($top !== []) {
-            $hot = $top[0];
-            if ($hot['name'] !== '{main}' && $hot['calls'] > 100) {
+        foreach ($top as $row) {
+            if ($row['name'] !== '{main}' && $row['calls'] > 100) {
                 $tips[] = sprintf(
                     'High call volume: %s ran %d times (%.2fs) — look for N+1 / loops.',
-                    $this->shortName($hot['name']),
-                    $hot['calls'],
-                    $hot['sec']
+                    $this->shortName($row['name']),
+                    $row['calls'],
+                    $row['sec']
                 );
             }
+        }
+
+        foreach ($this->churnHotspots() as $c) {
+            $label = match ($c['pattern']) {
+                'db_query' => sprintf('DB queries: %d executed ≈ %.2fs — check for missing eager-load/collection batching.', $c['calls'], $c['sec']),
+                'object_create' => sprintf('Object instantiation churn: %d ObjectManager/Factory creates ≈ %.2fs — DI overhead, look for objects built inside loops.', $c['calls'], $c['sec']),
+                'eav_attribute_load' => sprintf('EAV attribute loading: %d calls ≈ %.2fs — collection likely missing addAttributeToSelect(), re-fetching attributes per row.', $c['calls'], $c['sec']),
+                default => sprintf('%s: %d calls ≈ %.2fs.', $c['pattern'], $c['calls'], $c['sec']),
+            };
+            $tips[] = $label;
+        }
+
+        foreach ($this->repeatedCallSites(0.15, 2, 6) as $site) {
+            $tips[] = sprintf(
+                '%s called %d times from %s (≈%.2fs) — likely repeated load, check for a batch/cache opportunity.',
+                $this->shortName($site['callee']),
+                $site['calls'],
+                $this->shortName($site['caller']),
+                $site['sec']
+            );
+        }
+
+        foreach ($this->duplicateDispatches() as $d) {
+            $tips[] = sprintf(
+                '%s executed %d times in this single profile (≈%.2fs total) — duplicate request trigger? Check for double AJAX submit / retry logic.',
+                $this->shortName($d['name']),
+                $d['calls'],
+                $d['sec']
+            );
         }
 
         $tax = $this->pluginTax(0.05, 5);
