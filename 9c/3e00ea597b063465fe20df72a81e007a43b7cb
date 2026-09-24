@@ -1,0 +1,31 @@
+CachegrindAnalyzer.php
+  s_fada590c09458c::t_03a007abed8793 453-454
+  s_fada590c09458c::t_8efb34b5cafd03 1037,1039-1047
+  s_fada590c09458c::t_4f6f1c081c689a 427-432
+  s_fada590c09458c::t_167d79b6894314 349-351,358,364-367,369,375
+  s_fada590c09458c::t_235786e3d888b1 1029
+  s_fada590c09458c::t_6aa94bbdbbe309 443-448
+  s_fada590c09458c::t_a4e799ad6bbe2c 1019-1028
+  s_fada590c09458c::t_10f98c7f4fcfcb 340-348,352-357,368,370-374,376-379,426
+  s_fada590c09458c::t_2ae41e9c64cf13 380-425
+  s_fada590c09458c::t_d1d045b44fe183 359-363
+  s_fada590c09458c::t_87d564ae3dcc91 433-442,449-452,455-466
+  s_fada590c09458c::t_4fd31f35247004 1008-1009,1012-1014,1030-1036
+  s_fada590c09458c::t_12e3cec5e7d856 1038
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "9c3e00ea597b063465fe20df72a81e007a43b7cb",
+  "prompts": {},
+  "sessions": {
+    "s_fada590c09458c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4de00d20-e55a-4e0b-a7b7-5374595b79b5",
+        "model": "claude-sonnet-5"
+      },
+      "human_author": "satish.gumudavelli <satish.gumudavelli@kitchen365.com>"
+    }
+  }
+}
